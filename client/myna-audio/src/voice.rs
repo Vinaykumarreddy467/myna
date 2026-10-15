@@ -11,9 +11,11 @@ use std::time::Duration;
 /// long enough for a stable RMS at 16 kHz (320 samples).
 pub const FRAME: Duration = Duration::from_millis(20);
 
-/// Voice must stay above the silence threshold this long before it counts.
-/// A keystroke or a cough decays through the smoother in well under this;
-/// a spoken word does not.
+/// Voice must stay above the silence threshold this long before it counts,
+/// counting only frames that are loud themselves: the smoothed level keeps a
+/// run alive across a consonant's dip, but a click's decaying tail adds
+/// nothing. A keystroke, a clock tick or a cough fills a frame or two of it;
+/// a spoken word fills it.
 pub const SUSTAIN: Duration = Duration::from_millis(200);
 
 const INITIAL_FLOOR: f32 = 0.003;
@@ -77,7 +79,11 @@ impl VoiceTracker {
             .clamp(SPEECH_MIN * SILENCE_FACTOR, SPEECH_MAX * SILENCE_FACTOR);
         let active = self.started && smoothed >= silence_threshold;
         if active {
-            self.active_run += frame;
+            // Only a frame loud in itself adds to the run; a transient's
+            // smoothed tail merely keeps it from resetting.
+            if rms >= silence_threshold {
+                self.active_run += frame;
+            }
             if self.active_run >= SUSTAIN {
                 self.last_voice = Some(self.position);
                 self.speech_level = self.speech_level.max(smoothed);
@@ -283,5 +289,69 @@ mod tests {
         feed(&mut t, 0.01, Duration::from_millis(200));
         feed(&mut t, 1e-4, Duration::from_millis(400));
         assert!(t.noise_floor() < 5e-4, "floor {}", t.noise_floor());
+    }
+
+    fn tick(t: &mut VoiceTracker, ring: &[f32]) {
+        for &rms in ring {
+            t.observe(rms, FRAME);
+        }
+        feed(
+            t,
+            1e-4,
+            Duration::from_millis(1000) - FRAME * ring.len() as u32,
+        );
+    }
+
+    #[test]
+    fn a_ticking_clock_is_not_voice() {
+        for amplitude in [0.02, 0.05, 0.2] {
+            let mut t = VoiceTracker::default();
+            feed(&mut t, 1e-4, Duration::from_secs(1));
+            for _ in 0..60 {
+                tick(&mut t, &[amplitude]);
+            }
+            assert_eq!(t.last_voice(), None, "tick at {amplitude}");
+        }
+    }
+
+    #[test]
+    fn a_tick_with_a_short_ring_is_not_voice() {
+        let mut t = VoiceTracker::default();
+        feed(&mut t, 1e-4, Duration::from_secs(1));
+        for _ in 0..60 {
+            tick(&mut t, &[0.2, 0.08, 0.03]);
+        }
+        assert_eq!(t.last_voice(), None);
+    }
+
+    #[test]
+    fn speech_with_natural_dips_is_still_voice() {
+        let mut t = VoiceTracker::default();
+        feed(&mut t, 1e-4, Duration::from_secs(1));
+        for _ in 0..12 {
+            feed(&mut t, 0.01, Duration::from_millis(120));
+            feed(&mut t, 2e-4, Duration::from_millis(40));
+        }
+        let mark = t.last_voice().expect("speech was heard");
+        assert!(
+            mark >= Duration::from_millis(2900) && mark <= Duration::from_millis(3000),
+            "mark {mark:?}"
+        );
+    }
+
+    #[test]
+    fn speech_over_a_ticking_background_is_still_voice() {
+        let mut t = VoiceTracker::default();
+        feed(&mut t, 1e-4, Duration::from_secs(1));
+        for _ in 0..5 {
+            tick(&mut t, &[0.05]);
+        }
+        feed(&mut t, 0.01, Duration::from_secs(1));
+        let end = Duration::from_secs(7);
+        let mark = t.last_voice().expect("speech was heard");
+        assert!(
+            mark >= end - Duration::from_millis(40) && mark <= end + Duration::from_millis(100),
+            "mark {mark:?}"
+        );
     }
 }
