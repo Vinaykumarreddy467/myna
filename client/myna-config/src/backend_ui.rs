@@ -3212,6 +3212,15 @@ fn switch_report(outcome: &SwitchOutcome) -> (String, String) {
             push_final_connections(&mut details, Some(final_snapshot), None);
             gettextrs::gettext("The connections changed before the change could start. Try again.")
         }
+        SwitchOutcome::Busy {
+            change,
+            final_snapshot,
+        } => {
+            push_final_connections(&mut details, Some(final_snapshot), None);
+            details.push_str(&gettextrs::gettext("Error:\n"));
+            details.push_str(&diagnostics::redact_text(change));
+            gettextrs::gettext("The change could not be made.")
+        }
         SwitchOutcome::FinalDiscoveryFailed { error, completed } => {
             push_completed_operations(&mut details, completed);
             details.push_str(&gettextrs::gettext("Discovery error:\n"));

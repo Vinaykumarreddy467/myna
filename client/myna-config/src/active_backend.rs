@@ -135,6 +135,11 @@ pub enum SwitchOutcome {
     StaleDiscovery {
         final_snapshot: ConnectionSnapshot,
     },
+    /// snapd is still changing the selected model's snap, so nothing ran.
+    Busy {
+        change: String,
+        final_snapshot: ConnectionSnapshot,
+    },
     Noop {
         final_snapshot: ConnectionSnapshot,
     },
@@ -169,9 +174,10 @@ impl SwitchOutcome {
     pub fn notice(&self) -> SwitchNotice {
         match self {
             Self::Applied { .. } | Self::Noop { .. } | Self::Cancelled { .. } => SwitchNotice::None,
-            Self::Failed { .. } | Self::Disagreed { .. } | Self::StaleDiscovery { .. } => {
-                SwitchNotice::Failed
-            }
+            Self::Failed { .. }
+            | Self::Disagreed { .. }
+            | Self::StaleDiscovery { .. }
+            | Self::Busy { .. } => SwitchNotice::Failed,
             Self::FinalDiscoveryFailed { .. } => SwitchNotice::Unconfirmed,
         }
     }
@@ -181,6 +187,7 @@ impl SwitchOutcome {
             Self::Applied { final_snapshot, .. }
             | Self::Disagreed { final_snapshot, .. }
             | Self::StaleDiscovery { final_snapshot }
+            | Self::Busy { final_snapshot, .. }
             | Self::Noop { final_snapshot } => Some(final_snapshot),
             Self::Failed { final_snapshot, .. } | Self::Cancelled { final_snapshot, .. } => {
                 final_snapshot.as_ref()
@@ -226,6 +233,21 @@ pub async fn execute_switch(
         return cancelled_after_refresh(Vec::new(), repository).await;
     }
 
+    // snapd refuses to connect a model it is still installing, after the
+    // disconnect has already taken the working one away. A read that fails
+    // does not stop the switch.
+    if let Some(change) = change_on_selected(configurator, plan, cancellation.clone()).await {
+        myna_core::info_log!(
+            "switch",
+            "not switching to {}: snapd is still busy with \"{change}\"",
+            plan.selected().snap_name()
+        );
+        return SwitchOutcome::Busy {
+            change,
+            final_snapshot: preflight,
+        };
+    }
+
     let execution = configurator
         .execute_backend_switch(plan, cancellation.clone())
         .await;
@@ -243,7 +265,67 @@ pub async fn execute_switch(
             },
             Err(error) => SwitchOutcome::FinalDiscoveryFailed { completed, error },
         },
-        Err(failure) => failed_after_refresh(failure, repository).await,
+        Err(failure) => {
+            restore_previous_backend(plan, &failure, configurator, repository).await;
+            failed_after_refresh(failure, repository).await
+        }
+    }
+}
+
+/// The summary of snapd's change in progress on the selected model's snap.
+async fn change_on_selected(
+    configurator: &dyn SystemConfigurator,
+    plan: &SwitchPlan,
+    cancellation: CancellationToken,
+) -> Option<String> {
+    let changes = configurator.changes_in_progress(cancellation).await.ok()?;
+    let snaps = [plan.selected().snap_name()];
+    changes
+        .iter()
+        .find(|change| change.concerns(&snaps))
+        .map(|change| change.summary().to_owned())
+}
+
+/// After a switch failed past its disconnect, put back the one model that
+/// was connected, so Myna is not left with none. Best effort: the switch
+/// still reports its own failure, and the caller reads the connections back.
+async fn restore_previous_backend(
+    plan: &SwitchPlan,
+    failure: &SystemConfiguratorFailure,
+    configurator: &dyn SystemConfigurator,
+    repository: &dyn BackendRepository,
+) {
+    let ActiveBackendState::Connected(previous) = plan.baseline().active_state() else {
+        return;
+    };
+    if failure.completed().is_empty()
+        || matches!(
+            failure.error(),
+            SystemConfiguratorError::Cancelled
+                | SystemConfiguratorError::AuthorizationDenied { .. }
+        )
+        || previous == *plan.selected()
+    {
+        return;
+    }
+    let Ok(current) = repository.refresh(CancellationToken::new()).await else {
+        return;
+    };
+    let Ok(restore) = SwitchPlan::new(&current, previous.clone()) else {
+        return;
+    };
+    myna_core::info_log!("switch", "reconnecting {}", previous.snap_name());
+    match configurator
+        .execute_backend_switch(&restore, CancellationToken::new())
+        .await
+    {
+        Ok(_) => myna_core::info_log!("switch", "reconnected {}", previous.snap_name()),
+        Err(failure) => myna_core::info_log!(
+            "switch",
+            "could not reconnect {}: {}",
+            previous.snap_name(),
+            failure.error()
+        ),
     }
 }
 
@@ -382,6 +464,7 @@ pub async fn ensure_backend_active(
             Err(SetupError::Failed(error.message().to_owned()))
         }
         SwitchOutcome::Cancelled { .. } => Err(SetupError::Cancelled),
+        SwitchOutcome::Busy { change, .. } => Err(SetupError::Busy(change)),
         SwitchOutcome::Disagreed { .. } | SwitchOutcome::StaleDiscovery { .. } => {
             Err(SetupError::Failed(gettextrs::gettext(
                 "The model changed while it was being switched on. Try again.",

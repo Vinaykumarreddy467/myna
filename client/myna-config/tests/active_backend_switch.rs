@@ -268,6 +268,7 @@ struct FakeConfigurator {
     calls: Rc<RefCell<Vec<Vec<CommandRequest>>>>,
     restarts: Rc<RefCell<usize>>,
     changes: Rc<RefCell<VecDeque<ChangesRead>>>,
+    later: Rc<RefCell<VecDeque<ConfiguratorResult>>>,
 }
 
 type ConfiguratorResult = Result<Vec<CommandResult>, SystemConfiguratorFailure>;
@@ -279,7 +280,14 @@ impl FakeConfigurator {
             calls: Rc::new(RefCell::new(Vec::new())),
             restarts: Rc::new(RefCell::new(0)),
             changes: Rc::default(),
+            later: Rc::default(),
         }
+    }
+
+    /// What the next switch executions return, after the first.
+    fn then(self, result: ConfiguratorResult) -> Self {
+        self.later.borrow_mut().push_back(result);
+        self
     }
 
     /// What successive reads of snapd's changes report; once exhausted,
@@ -330,7 +338,10 @@ impl SystemConfigurator for FakeConfigurator {
         _cancellation: CancellationToken,
     ) -> Result<Vec<CommandResult>, SystemConfiguratorFailure> {
         self.calls.borrow_mut().push(plan.operations().to_vec());
-        self.result.borrow_mut().take().unwrap()
+        let first = self.result.borrow_mut().take();
+        first
+            .or_else(|| self.later.borrow_mut().pop_front())
+            .unwrap()
     }
 
     async fn restart_myna(
@@ -518,11 +529,19 @@ fn every_operation_failure_and_auth_denial_still_rediscover_actual_state() {
             initial.clone(),
         ),
     ] {
-        let repository = FakeRepository::new([Ok(initial.clone()), Ok(final_state.clone())]);
+        // A disconnect that ran is followed by a read and an attempt to
+        // put the old model back, before the final read.
+        let restores = !completed.is_empty();
+        let repository = FakeRepository::new(
+            std::iter::once(Ok(initial.clone()))
+                .chain(restores.then(|| Ok(disconnected.clone())))
+                .chain([Ok(final_state.clone())]),
+        );
         let configurator = FakeConfigurator::returning(Err(SystemConfiguratorFailure::new(
             completed.clone(),
             error.clone(),
-        )));
+        )))
+        .then(Ok(Vec::new()));
         let outcome = block_on(execute_switch(
             &plan,
             &configurator,
@@ -538,8 +557,232 @@ fn every_operation_failure_and_auth_denial_still_rediscover_actual_state() {
                 ..
             } if actual_completed == completed && actual_error == error && actual == final_state
         ));
+        assert_eq!(repository.calls(), if restores { 3 } else { 2 });
+    }
+}
+
+/// The user opened Settings again while snapd was still installing the model
+/// and picked it: the disconnect would succeed and the connect be refused.
+#[test]
+fn a_switch_to_a_model_snapd_is_still_installing_changes_nothing() {
+    let initial = connections(&["old", "myna-parakeet"], &["old"]);
+    let plan =
+        SwitchPlan::new(&initial, BackendIdentity::new("myna-parakeet", "provider")).unwrap();
+    let repository = FakeRepository::new([Ok(initial.clone())]);
+    let configurator = FakeConfigurator::returning(Ok(success(&plan))).with_changes([installing()]);
+
+    let outcome = block_on(execute_switch(
+        &plan,
+        &configurator,
+        &repository,
+        CancellationToken::new(),
+    ));
+
+    assert_eq!(
+        outcome,
+        SwitchOutcome::Busy {
+            change: "Install \"myna-parakeet\" snap from \"edge\" channel".to_owned(),
+            final_snapshot: initial.clone(),
+        }
+    );
+    assert_eq!(outcome.notice(), SwitchNotice::Failed);
+    assert_eq!(outcome.final_snapshot(), Some(&initial));
+    assert_eq!(configurator.calls(), Vec::<Vec<CommandRequest>>::new());
+    assert_eq!(repository.calls(), 1);
+}
+
+#[test]
+fn a_change_in_progress_on_another_snap_does_not_block_a_switch() {
+    let initial = connections(&["old", "new"], &["old"]);
+    let final_state = connections(&["old", "new"], &["new"]);
+    let plan = SwitchPlan::new(&initial, BackendIdentity::new("new", "provider")).unwrap();
+    let repository = FakeRepository::new([Ok(initial), Ok(final_state)]);
+    let configurator = FakeConfigurator::returning(Ok(success(&plan)))
+        .with_changes([change("Install \"unrelated\" snap")]);
+
+    let outcome = block_on(execute_switch(
+        &plan,
+        &configurator,
+        &repository,
+        CancellationToken::new(),
+    ));
+
+    assert!(matches!(outcome, SwitchOutcome::Applied { .. }));
+    assert_eq!(configurator.calls(), [plan.operations()]);
+}
+
+#[test]
+fn an_unreadable_changes_list_does_not_block_a_switch() {
+    let initial = connections(&["old", "new"], &["old"]);
+    let final_state = connections(&["old", "new"], &["new"]);
+    let plan = SwitchPlan::new(&initial, BackendIdentity::new("new", "provider")).unwrap();
+    let repository = FakeRepository::new([Ok(initial), Ok(final_state)]);
+    let configurator = FakeConfigurator::returning(Ok(success(&plan)))
+        .with_changes([Err("snapd unreachable".to_owned())]);
+
+    let outcome = block_on(execute_switch(
+        &plan,
+        &configurator,
+        &repository,
+        CancellationToken::new(),
+    ));
+
+    assert!(matches!(outcome, SwitchOutcome::Applied { .. }));
+}
+
+#[test]
+fn a_failed_connect_reconnects_the_model_that_was_connected() {
+    let initial = connections(&["old", "new"], &["old"]);
+    let disconnected = connections(&["old", "new"], &[]);
+    let restored = connections(&["old", "new"], &["old"]);
+    let plan = SwitchPlan::new(&initial, BackendIdentity::new("new", "provider")).unwrap();
+    let refused = SystemConfiguratorError::execution(
+        "pkexec",
+        vec![],
+        Some(1),
+        "connect",
+        "changes in progress",
+    );
+    let repository =
+        FakeRepository::new([Ok(initial), Ok(disconnected.clone()), Ok(restored.clone())]);
+    let configurator = FakeConfigurator::returning(Err(SystemConfiguratorFailure::new(
+        success(&plan)[..1].to_vec(),
+        refused.clone(),
+    )))
+    .then(Ok(Vec::new()));
+
+    let outcome = block_on(execute_switch(
+        &plan,
+        &configurator,
+        &repository,
+        CancellationToken::new(),
+    ));
+
+    let restore = SwitchPlan::new(&disconnected, BackendIdentity::new("old", "provider")).unwrap();
+    assert_eq!(
+        configurator.calls(),
+        [plan.operations().to_vec(), restore.operations().to_vec()]
+    );
+    assert_eq!(
+        argv(&restore),
+        [
+            ("snap", vec!["connect", "myna:backend", "old:provider"]),
+            (
+                "systemctl",
+                vec!["--user", "restart", "snap.myna.myna.service"]
+            ),
+        ]
+    );
+    assert_eq!(restore.operations()[1], myna_restart_request());
+    assert!(matches!(
+        outcome,
+        SwitchOutcome::Failed {
+            error,
+            final_snapshot: Some(actual),
+            ..
+        } if error == refused && actual == restored
+    ));
+    assert_eq!(repository.calls(), 3);
+}
+
+#[test]
+fn a_failed_restore_still_reports_the_original_failure() {
+    let initial = connections(&["old", "new"], &["old"]);
+    let disconnected = connections(&["old", "new"], &[]);
+    let plan = SwitchPlan::new(&initial, BackendIdentity::new("new", "provider")).unwrap();
+    let refused = SystemConfiguratorError::execution("pkexec", vec![], Some(1), "connect", "busy");
+    let repository = FakeRepository::new([
+        Ok(initial),
+        Ok(disconnected.clone()),
+        Ok(disconnected.clone()),
+    ]);
+    let configurator = FakeConfigurator::returning(Err(SystemConfiguratorFailure::new(
+        success(&plan)[..1].to_vec(),
+        refused.clone(),
+    )))
+    .then(Err(SystemConfiguratorFailure::new(
+        Vec::new(),
+        SystemConfiguratorError::execution("pkexec", vec![], Some(1), "connect", "still busy"),
+    )));
+
+    let outcome = block_on(execute_switch(
+        &plan,
+        &configurator,
+        &repository,
+        CancellationToken::new(),
+    ));
+
+    assert_eq!(configurator.calls().len(), 2);
+    assert!(matches!(
+        outcome,
+        SwitchOutcome::Failed {
+            error,
+            final_snapshot: Some(actual),
+            ..
+        } if error == refused && actual == disconnected
+    ));
+}
+
+#[test]
+fn no_model_is_reconnected_unless_a_disconnect_ran_and_one_model_was_connected() {
+    let one = connections(&["old", "new"], &["old"]);
+    let none = connections(&["old", "new"], &[]);
+    let both = connections(&["old", "new"], &["old", "new"]);
+    let new = BackendIdentity::new("new", "provider");
+    let denied = || SystemConfiguratorError::authorization_denied("pkexec", vec![], Some(126), "");
+    let failed = || SystemConfiguratorError::execution("pkexec", vec![], Some(1), "x", "failed");
+    for (baseline, completed_ops, error) in [
+        // A cancellation or denial is the user's choice, not a refusal.
+        (one.clone(), 1, SystemConfiguratorError::Cancelled),
+        (one.clone(), 1, denied()),
+        // The disconnect itself failed: nothing to put back.
+        (one.clone(), 0, failed()),
+        // Nothing was connected before, so there is nothing to restore.
+        (none.clone(), 1, failed()),
+        // Several were connected: no single model to go back to.
+        (both.clone(), 2, failed()),
+    ] {
+        let plan = SwitchPlan::new(&baseline, new.clone()).unwrap();
+        let repository = FakeRepository::new([Ok(baseline.clone()), Ok(none.clone())]);
+        let configurator = FakeConfigurator::returning(Err(SystemConfiguratorFailure::new(
+            success(&plan)[..completed_ops].to_vec(),
+            error,
+        )));
+        block_on(execute_switch(
+            &plan,
+            &configurator,
+            &repository,
+            CancellationToken::new(),
+        ));
+        assert_eq!(
+            configurator.calls().len(),
+            1,
+            "{baseline:?} {completed_ops}"
+        );
         assert_eq!(repository.calls(), 2);
     }
+}
+
+#[test]
+fn setting_up_reports_a_model_still_installing_as_busy() {
+    let snapshot = connections(&["myna-parakeet"], &[]);
+    let repository = FakeRepository::new([Ok(snapshot.clone()), Ok(snapshot)]);
+    let configurator =
+        FakeConfigurator::returning(Ok(Vec::new())).with_changes([Ok(Vec::new()), installing()]);
+
+    let result = block_on(ensure_backend_active(
+        &repository,
+        &configurator,
+        None,
+        &no_wait(),
+        &unheard,
+    ));
+
+    assert_eq!(
+        result.unwrap_err(),
+        SetupError::Busy("Install \"myna-parakeet\" snap from \"edge\" channel".to_owned())
+    );
+    assert_eq!(configurator.calls(), Vec::<Vec<CommandRequest>>::new());
 }
 
 #[test]
