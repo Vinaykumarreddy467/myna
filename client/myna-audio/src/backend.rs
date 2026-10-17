@@ -11,6 +11,7 @@ use bytes::{Bytes, BytesMut};
 use myna_core::{AudioFormat, CaptureError, CaptureHealth, PcmChunk, StopHandle};
 use tokio::sync::watch;
 
+use crate::dc_block::DcBlocker;
 use crate::ring::Ring;
 use crate::stats::AudioStats;
 use crate::voice::{VoiceTracker, FRAME as VOICE_FRAME};
@@ -50,6 +51,9 @@ pub struct Producer {
     captured: Duration,
     session_peak: f32,
     voice: VoiceTracker,
+    /// Set by [`Producer::remove_dc`]; filters each chunk before it is
+    /// measured or delivered.
+    dc_block: Option<DcBlocker>,
 }
 
 impl Producer {
@@ -73,7 +77,15 @@ impl Producer {
             captured: Duration::ZERO,
             session_peak: 0.0,
             voice: VoiceTracker::default(),
+            dc_block: None,
         }
+    }
+
+    /// Take a microphone's DC offset out of everything this producer
+    /// measures and delivers from now on (#64). Live capture only: the
+    /// scripted backend's bytes stay exactly as written.
+    pub(crate) fn remove_dc(&mut self) {
+        self.dc_block = Some(DcBlocker::new(self.format));
     }
 
     /// Deliver raw PCM (any buffer size; the adapter re-chunks to whole-frame
@@ -132,6 +144,14 @@ impl Producer {
     }
 
     fn emit(&mut self, data: Bytes) {
+        let data = match self.dc_block.as_mut() {
+            Some(dc_block) => {
+                let mut owned = BytesMut::from(&data[..]);
+                dc_block.process(&mut owned);
+                owned.freeze()
+            }
+            None => data,
+        };
         let chunk = PcmChunk::new(data, self.format);
         let (rms, peak, clipped) = levels(&chunk);
         for (frame_rms, frame) in frame_levels(&chunk) {
@@ -272,6 +292,89 @@ mod tests {
         let frames = frame_levels(&s16_chunk(0, 400));
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[1].1, Duration::from_millis(5));
+    }
+
+    /// -13 dBFS, negative, as the reporter's microphone delivered it (#64).
+    const OFFSET: i16 = -7336;
+    const RATE: usize = 16_000;
+
+    /// A producer that removes DC, with its stats tap and the ring it
+    /// delivers to; 100 ms chunks of 16 kHz mono.
+    fn dc_free_producer() -> (Producer, watch::Receiver<AudioStats>, Arc<Ring>) {
+        let format = AudioFormat::default();
+        let ring = Ring::new(1 << 24, format);
+        let (stats, stats_rx) = watch::channel(AudioStats::default());
+        let (health, _) = watch::channel(CaptureHealth::Opening);
+        let mut producer = Producer::new(ring.clone(), stats, health, format, 3_200, 2);
+        producer.remove_dc();
+        (producer, stats_rx, ring)
+    }
+
+    /// `seconds` of a 300 Hz sine of linear RMS `level`, on `offset`.
+    fn speech(level: f32, offset: i16, seconds: f32) -> Vec<i16> {
+        let amplitude = level * std::f32::consts::SQRT_2 * 32768.0;
+        (0..(RATE as f32 * seconds) as usize)
+            .map(|i| {
+                let phase = 2.0 * std::f32::consts::PI * 300.0 * i as f32 / RATE as f32;
+                (amplitude * phase.sin() + offset as f32).round() as i16
+            })
+            .collect()
+    }
+
+    fn bytes_of(samples: &[i16]) -> Vec<u8> {
+        samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn a_dc_offset_mic_reads_as_silence() {
+        let (mut producer, stats, _ring) = dc_free_producer();
+        for _ in 0..50 {
+            producer.push(Bytes::from(bytes_of(&[OFFSET; RATE / 10])));
+        }
+        let stats = *stats.borrow();
+        assert!(stats.rms < 0.001, "a silent room read at rms {}", stats.rms);
+        assert_eq!(stats.last_voice, None, "the offset was taken for voice");
+    }
+
+    #[test]
+    fn speech_over_a_dc_offset_is_still_heard() {
+        let (mut producer, stats, _ring) = dc_free_producer();
+        let mut input = vec![OFFSET; RATE];
+        input.extend(speech(0.01, OFFSET, 1.0));
+        input.extend(vec![OFFSET; RATE * 2]);
+        for piece in input.chunks(RATE / 10) {
+            producer.push(Bytes::from(bytes_of(piece)));
+        }
+        let stats = *stats.borrow();
+        let heard = stats.last_voice.expect("the speech was heard");
+        assert!(
+            heard >= Duration::from_millis(2_000) && heard <= Duration::from_millis(2_100),
+            "voice last heard at {heard:?}, not where the speech ended (2 s)"
+        );
+        assert!(stats.speech_level > 0.008, "speech {}", stats.speech_level);
+    }
+
+    #[tokio::test]
+    async fn the_filter_runs_across_chunk_boundaries() {
+        let input = bytes_of(&speech(0.07, OFFSET, 1.0));
+        let mut expected = input.clone();
+        crate::dc_block::DcBlocker::new(AudioFormat::default()).process(&mut expected);
+
+        let (mut producer, _stats, ring) = dc_free_producer();
+        let mut rest = input.as_slice();
+        for samples in [1, 7, 1_601, 999, 3_000, 33] {
+            let (head, tail) = rest.split_at(samples * 2);
+            producer.push(Bytes::copy_from_slice(head));
+            rest = tail;
+        }
+        producer.push(Bytes::copy_from_slice(rest));
+        producer.finish(None);
+        let mut delivered = Vec::new();
+        while let Some(Ok(chunk)) = ring.next().await {
+            delivered.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(delivered.len(), expected.len());
+        assert!(delivered == expected, "the delivered audio is not DC-free");
     }
 
     #[test]

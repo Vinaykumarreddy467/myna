@@ -1534,6 +1534,79 @@ async fn mono_capture_of_a_stereo_source_mixes_in_the_right_channel() {
     );
 }
 
+/// A microphone at a constant DC offset (an AMD ACP PDM mic sat at
+/// -13 dBFS, #64) reads as continuous voice unless capture removes it. The
+/// probe carries that offset and a 300 Hz tone in both channels: what reaches
+/// the consumer must have lost the offset and kept the tone, so a capture
+/// that delivered nothing fails as surely as one that kept the offset.
+#[tokio::test]
+async fn a_microphone_dc_offset_is_removed_and_its_tone_kept() {
+    skip_unless_enabled!();
+    let vsrc = VirtualSource::spawn("myna-test-dc-offset");
+    let probe = scratch_dir("dc-offset").join("probe.raw");
+    let frames = PROBE_RATE as usize * 8;
+    let mut pcm = Vec::with_capacity(frames * 4);
+    for n in 0..frames {
+        let t = n as f64 / PROBE_RATE as f64;
+        let tone = (std::f64::consts::TAU * 300.0 * t).sin() * 0.1 * i16::MAX as f64;
+        let sample = (tone - 7_336.0) as i16;
+        pcm.extend_from_slice(&sample.to_le_bytes());
+        pcm.extend_from_slice(&sample.to_le_bytes());
+    }
+    std::fs::write(&probe, pcm).expect("write probe pcm");
+    let _player = Killed(vsrc.play(&probe));
+
+    let fmt = AudioFormat::default();
+    let source = CaptureSource::builder(fmt)
+        .ring_depth(Duration::from_secs(30))
+        .target(vsrc.node_name.clone())
+        .backend(Box::new(PipeWireBackend::new()))
+        .build();
+    let mut stats = source.stats();
+    let stop = source.stop_handle();
+    let stream = Box::new(source).capture();
+    let captured = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if stats.borrow_and_update().captured >= Duration::from_millis(1_500) {
+                break true;
+            }
+            if stats.changed().await.is_err() {
+                break false;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    stop.stop();
+    let (chunks, fault) = drain_with_timeout(stream, Duration::from_secs(3)).await;
+    assert!(fault.is_none(), "clean end: {fault:?}");
+    assert!(captured, "captured 1.5s from the cable");
+
+    // Past the link-up, as in the stereo downmix case.
+    let samples: Vec<f64> = chunks
+        .iter()
+        .flat_map(|c| c.data.chunks_exact(2))
+        .map(|b| f64::from(i16::from_le_bytes([b[0], b[1]])) / 32_768.0)
+        .skip(fmt.sample_rate_hz as usize / 2)
+        .collect();
+    assert!(
+        samples.len() > fmt.sample_rate_hz as usize / 2,
+        "enough audio to analyse, got {} samples",
+        samples.len()
+    );
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let rms =
+        (samples.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / samples.len() as f64).sqrt();
+    assert!(
+        mean.abs() < 0.005,
+        "the offset reached the consumer: mean {mean:.4}"
+    );
+    assert!(
+        rms > 0.03,
+        "the tone did not reach the consumer: rms {rms:.4}"
+    );
+}
+
 fn cue() -> myna_audio::playback::Clip {
     myna_audio::playback::Clip::decode_ogg(std::io::Cursor::new(
         &include_bytes!("sounds/cue.oga")[..],

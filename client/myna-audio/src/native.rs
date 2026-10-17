@@ -740,7 +740,7 @@ impl PipeWireBackend {
 }
 
 impl CaptureBackend for PipeWireBackend {
-    fn start(self: Box<Self>, spec: CaptureSpec, producer: Producer) {
+    fn start(self: Box<Self>, spec: CaptureSpec, mut producer: Producer) {
         // Only S16LE lives in the format universe today. Reject other widths
         // up front — cheap, testable offline
         // (T008), no PipeWire connection needed.
@@ -761,6 +761,9 @@ impl CaptureBackend for PipeWireBackend {
             )));
             return;
         }
+        // A real microphone can sit at a DC offset (an AMD ACP PDM mic did at
+        // -13 dBFS, #64), which every level reading takes for voice.
+        producer.remove_dc();
         // The loop and its objects are not `Send`, so everything PipeWire
         // lives on this thread. A failed spawn drops the producer, which
         // faults the capture rather than hanging it.

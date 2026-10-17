@@ -30,12 +30,15 @@
 //! `pw-record` subprocess was retired, FR-016). Real DSP (noise suppression
 //! etc.) is PipeWire
 //! filter-chain territory upstream of the capture node — this crate observes,
-//! it never transforms (§10).
+//! it never transforms (§10). The one exception is a microphone's DC offset,
+//! which live capture removes before anything measures or sends the audio
+//! (`dc_block`, #64): left in, every level reading takes it for voice.
 //!
 //! The one output path is [`playback`]: short one-shot cues, never the
 //! microphone's audio.
 
 mod backend;
+mod dc_block;
 mod devices;
 mod fake;
 mod native;
